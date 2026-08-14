@@ -40,7 +40,15 @@ need_git() {
   git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "当前目录不是 git 仓库"
 }
 
-# 按「前缀 + 后缀」分成不同格式，例如:
+primary_remote() {
+  if git remote | grep -qx origin; then
+    echo origin
+    return
+  fi
+  git remote | head -n1
+}
+
+# 按「前缀 + 后缀」分成不同格式，结果写入 _family
 #   1.1.2        -> *
 #   1.1.1-dev    -> *-dev
 #   v2.0.0       -> v*
@@ -55,55 +63,52 @@ family_of() {
   fi
 
   if [[ "$rest" =~ ^[0-9]+(\.[0-9]+)* ]]; then
-    echo "${prefix}*${rest:${#BASH_REMATCH[0]}}"
+    _family="${prefix}*${rest:${#BASH_REMATCH[0]}}"
   else
-    echo "$tag"
+    _family="$tag"
   fi
 }
 
 # * -> latest, *-dev -> dev, v* -> v, v*-dev -> v-dev
+# 结果写入 _channel
 channel_of() {
   local label="${1//\*/}"
   label="${label#-}"
   label="${label%-}"
   if [ -z "$label" ]; then
-    echo latest
+    _channel=latest
   else
-    echo "$label"
+    _channel="$label"
   fi
+}
+
+each_tag_desc() {
+  git for-each-ref --sort=-version:refname --format='%(refname:short)' refs/tags
 }
 
 show_max_tags() {
   need_git
 
-  local tags tag family channel
-  tags=$(git tag --list --sort=-v:refname || true)
-  if [ -z "$tags" ]; then
-    echo "no tags"
-    return
-  fi
-
+  local tag found=0
   unset seen_families 2>/dev/null || true
   declare -A seen_families=()
   while IFS= read -r tag; do
     [ -z "$tag" ] && continue
-    family=$(family_of "$tag")
-    if [ -z "${seen_families[$family]+x}" ]; then
-      seen_families[$family]=1
-      channel=$(channel_of "$family")
-      if [ "$channel" = "latest" ]; then
-        printf '  %s%-8s%s %s%s%s\n' "$C_GREEN" "$channel" "$C_RESET" "$C_GREEN_BOLD" "$tag" "$C_RESET"
+    found=1
+    family_of "$tag"
+    if [ -z "${seen_families[$_family]+x}" ]; then
+      seen_families[$_family]=1
+      channel_of "$_family"
+      if [ "$_channel" = "latest" ]; then
+        printf '  %s%-8s%s %s%s%s\n' "$C_GREEN" "$_channel" "$C_RESET" "$C_GREEN_BOLD" "$tag" "$C_RESET"
       else
-        printf '  %s%-8s%s %s%s%s\n' "$C_DIM" "$channel" "$C_RESET" "$C_BOLD" "$tag" "$C_RESET"
+        printf '  %s%-8s%s %s%s%s\n' "$C_DIM" "$_channel" "$C_RESET" "$C_BOLD" "$tag" "$C_RESET"
       fi
     fi
-  done <<EOF
-$tags
-EOF
-}
-
-fetch_tags() {
-  git fetch --tags --quiet 2>/dev/null || true
+  done < <(each_tag_desc)
+  if [ "$found" -eq 0 ]; then
+    echo "no tags"
+  fi
 }
 
 # 1.1.2 -> 1.1.3, 1.1.1-dev -> 1.1.2-dev, v1.2.9 -> v1.2.10
@@ -120,21 +125,43 @@ bump_patch() {
 
 max_tag_for_channel() {
   local want="$1"
-  local tag family channel
-  local tags
-  tags=$(git tag --list --sort=-v:refname || true)
+  local tag
   while IFS= read -r tag; do
     [ -z "$tag" ] && continue
-    family=$(family_of "$tag")
-    channel=$(channel_of "$family")
-    if [ "$channel" = "$want" ]; then
+    family_of "$tag"
+    channel_of "$_family"
+    if [ "$_channel" = "$want" ]; then
       echo "$tag"
       return 0
     fi
-  done <<EOF
-$tags
-EOF
+  done < <(each_tag_desc)
   return 1
+}
+
+max_remote_tag_for_channel() {
+  local want="$1"
+  local remote ref tag
+  remote=$(primary_remote)
+  [ -n "$remote" ] || return 1
+  while IFS=$'\t' read -r _ ref; do
+    [ -z "$ref" ] && continue
+    tag="${ref#refs/tags/}"
+    family_of "$tag"
+    channel_of "$_family"
+    if [ "$_channel" = "$want" ]; then
+      echo "$tag"
+      return 0
+    fi
+  done < <(git ls-remote --refs --tags --sort=-version:refname "$remote" 2>/dev/null || true)
+  return 1
+}
+
+remote_has_tag() {
+  local version="$1"
+  local remote
+  remote=$(primary_remote)
+  [ -n "$remote" ] || return 1
+  [ -n "$(git ls-remote --refs --tags "$remote" "refs/tags/$version" 2>/dev/null || true)" ]
 }
 
 print_push_line() {
@@ -150,16 +177,23 @@ print_push_line() {
 
 create_and_push() {
   local version="$1"
+  local remote
   need_git
 
   if git rev-parse -q --verify "refs/tags/$version" >/dev/null; then
     die "tag $version 已存在"
   fi
+  if remote_has_tag "$version"; then
+    die "远程已有 tag $version"
+  fi
+
+  remote=$(primary_remote)
+  [ -n "$remote" ] || die "没有 git remote"
 
   echo "git tag $version"
   git tag "$version"
-  echo "git push --tags"
-  git push --tags 2>&1 | while IFS= read -r line || [ -n "$line" ]; do
+  echo "git push $remote $version"
+  git push "$remote" "refs/tags/$version" 2>&1 | while IFS= read -r line || [ -n "$line" ]; do
     print_push_line "$line"
   done
   [ "${PIPESTATUS[0]}" -eq 0 ]
@@ -168,13 +202,27 @@ create_and_push() {
   printf '%s' "$C_RESET"
 }
 
+higher_tag() {
+  printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1
+}
+
 do_next() {
   local channel="${1:-latest}"
-  local current next
+  local current next local_cur="" remote_cur=""
   need_git
-  fetch_tags
 
-  current=$(max_tag_for_channel "$channel") || die "没有 $channel 渠道的 tag"
+  local_cur=$(max_tag_for_channel "$channel" || true)
+  remote_cur=$(max_remote_tag_for_channel "$channel" || true)
+  if [ -n "$local_cur" ] && [ -n "$remote_cur" ]; then
+    current=$(higher_tag "$local_cur" "$remote_cur")
+  elif [ -n "$local_cur" ]; then
+    current="$local_cur"
+  elif [ -n "$remote_cur" ]; then
+    current="$remote_cur"
+  else
+    die "没有 $channel 渠道的 tag"
+  fi
+
   next=$(bump_patch "$current")
   echo "$current -> $next"
   create_and_push "$next"
@@ -202,7 +250,6 @@ $(usage)"
       die "一次只接收一个版本号
 $(usage)"
     fi
-    fetch_tags
     create_and_push "$1"
     ;;
 esac
