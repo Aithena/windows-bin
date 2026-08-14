@@ -584,8 +584,11 @@ fill_bar() {
       done
       ;;
     running)
-      fill=$((percent * width / 100))
-      [ "$fill" -lt 1 ] && fill=1
+      fill=$percent
+      case "$fill" in
+        ''|*[!0-9]*) fill=0 ;;
+      esac
+      [ "$fill" -gt $((width - 2)) ] && fill=$((width - 2))
       for ((i = 0; i < width; i++)); do
         if [ "$i" -lt "$fill" ]; then
           _bar+="#"
@@ -644,10 +647,15 @@ draw_two_phases() {
 
 watch_remote_pack() {
   local version="$1"
-  local token sha state="" elapsed=0 last=""
+  local token sha state="" elapsed=0 last="" now
   local p_st=pending p_pct=0 p_sec=0 d_st=pending d_pct=0 d_sec=0
-  local detect_limit timeout_limit
+  local p_cells=0 d_cells=0 p_draw
+  local bar_width=12 hold=2 cap phase1_cells pack_elapsed
+  local t0=0 pack_t0=0 deploy_t0=0 last_probe=0
+  local detect_limit timeout_limit probe_file done_file
   _pack_ui_drawn=0
+  _tag_watch_pid=""
+  _tag_watch_file=""
 
   [ "${TAG_WATCH:-1}" = "0" ] && return 0
   command -v python >/dev/null 2>&1 || return 0
@@ -661,43 +669,115 @@ watch_remote_pack() {
   sha=$(git rev-parse "${version}^{commit}" 2>/dev/null) || sha=$(git rev-parse "$version")
   detect_limit="${TAG_WATCH_DETECT:-20}"
   timeout_limit="${TAG_WATCH_TIMEOUT:-600}"
+  t0=$(date +%s)
+  pack_t0=$t0
+  cap=$((bar_width - hold))
+  phase1_cells=$(( (bar_width * 30 + 50) / 100 ))
+  probe_file=$(mktemp "${TMPDIR:-/tmp}/tag-watch.XXXXXX")
+  done_file="${probe_file}.done"
+  _tag_watch_file=$probe_file
+
+  cleanup_watch() {
+    if [ -n "${_tag_watch_pid:-}" ]; then
+      kill "$_tag_watch_pid" 2>/dev/null || true
+      _tag_watch_pid=""
+    fi
+    rm -f "${_tag_watch_file:-}" "${_tag_watch_file:-}.done" "${_tag_watch_file:-}.part" "${_tag_watch_file:-}.busy"
+    _tag_watch_file=""
+  }
+  trap cleanup_watch EXIT
 
   while [ "$elapsed" -le "$timeout_limit" ]; do
-    last=$(pack_probe "$_kind" "$_base" "$_project" "$sha" "$version" "$token" || true)
-    IFS=$'\t' read -r state p_st p_pct p_sec d_st d_pct d_sec <<<"$last"
-    [ -z "$state" ] && state=none
+    now=$(date +%s)
+    elapsed=$((now - t0))
+
+    if [ -f "$done_file" ]; then
+      last=$(cat "$done_file" 2>/dev/null || true)
+      rm -f "$done_file"
+      IFS=$'\t' read -r state p_st p_pct p_sec d_st d_pct d_sec <<<"$last"
+      [ -z "$state" ] && state=none
+    fi
+
+    if [ ! -f "${probe_file}.busy" ]; then
+      if [ "$last_probe" -eq 0 ] || [ $((now - last_probe)) -ge 2 ]; then
+        : >"${probe_file}.busy"
+        (
+          set +e
+          pack_probe "$_kind" "$_base" "$_project" "$sha" "$version" "$token" >"${probe_file}.part" 2>/dev/null
+          mv "${probe_file}.part" "$done_file" 2>/dev/null
+          rm -f "${probe_file}.busy"
+        ) &
+        _tag_watch_pid=$!
+        last_probe=$now
+      fi
+    fi
+
+    pack_elapsed=$((now - pack_t0))
+    if [ "$pack_elapsed" -le 10 ]; then
+      p_cells=$((phase1_cells * pack_elapsed / 10))
+    else
+      p_cells=$((phase1_cells + (pack_elapsed - 10) / 10))
+    fi
+    [ "$p_cells" -gt "$cap" ] && p_cells=$cap
+    if [ "$p_st" = "success" ] || [ "$p_st" = "failure" ]; then
+      p_cells=$bar_width
+    fi
+
+    if [ "$d_st" = "running" ] || [ "$d_st" = "success" ] || [ "$d_st" = "failure" ]; then
+      if [ "$deploy_t0" -eq 0 ]; then
+        deploy_t0=$now
+      fi
+      d_cells=$(( (now - deploy_t0) * 2 ))
+      [ "$d_cells" -gt "$cap" ] && d_cells=$cap
+      if [ "$d_st" = "success" ] || [ "$d_st" = "failure" ]; then
+        d_cells=$bar_width
+      fi
+    else
+      d_cells=0
+    fi
 
     case "$state" in
       auth)
+        trap - EXIT
+        cleanup_watch
         printf '%s远程打包跟踪失败：令牌无效或没有权限%s\n' "$C_GRAY" "$C_RESET"
         return 0
         ;;
-      none)
+      none|"")
         if [ "$elapsed" -ge "$detect_limit" ]; then
           if [ -t 1 ] && [ "${_pack_ui_drawn:-0}" = 1 ]; then
             printf '\033[2A\r\033[K\n\r\033[K\033[1A'
           elif [ -t 1 ]; then
             printf '\r\033[K'
           fi
+          trap - EXIT
+          cleanup_watch
           printf '%s未检测到远程打包%s\n' "$C_GRAY" "$C_RESET"
           return 0
         fi
-        draw_two_phases pending 0 0 pending 0 0 "$elapsed"
+        draw_two_phases running "$p_cells" "$elapsed" pending 0 0 "$elapsed"
         ;;
       pending|running|success|failure)
-        draw_two_phases "${p_st:-pending}" "${p_pct:-0}" "${p_sec:-0}" \
-          "${d_st:-pending}" "${d_pct:-0}" "${d_sec:-0}" "$elapsed"
+        p_draw=${p_st:-pending}
+        if [ "$p_draw" != "success" ] && [ "$p_draw" != "failure" ]; then
+          p_draw=running
+        fi
+        draw_two_phases "$p_draw" "$p_cells" "${p_sec:-0}" \
+          "${d_st:-pending}" "$d_cells" "${d_sec:-0}" "$elapsed"
         if [ "$state" = "success" ]; then
+          trap - EXIT
+          cleanup_watch
           return 0
         fi
         if [ "$state" = "failure" ]; then
+          trap - EXIT
+          cleanup_watch
           die "远程打包失败"
         fi
         ;;
     esac
 
-    sleep 2
-    elapsed=$((elapsed + 2))
+    sleep 1
   done
 
   if [ -t 1 ] && [ "${_pack_ui_drawn:-0}" = 1 ]; then
@@ -705,6 +785,8 @@ watch_remote_pack() {
   elif [ -t 1 ]; then
     printf '\r\033[K'
   fi
+  trap - EXIT
+  cleanup_watch
   printf '%s远程打包超时（%ss）%s\n' "$C_GRAY" "$timeout_limit" "$C_RESET"
 }
 
