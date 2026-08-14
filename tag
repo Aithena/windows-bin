@@ -3,7 +3,7 @@
 #   tag              显示各格式当前最高版本
 #   tag next         在 latest 上补丁号 +1 并推送
 #   tag next dev     在指定渠道上补丁号 +1 并推送
-#   tag 1.11.11      git tag 1.11.11 && git push --tags && date
+#   tag 1.11.11      git tag 1.11.11 && git push && 跟踪远程打包
 
 set -eu
 
@@ -14,10 +14,11 @@ if [ -t 1 ]; then
   C_GREEN_BOLD=$'\033[1;32m'
   C_CYAN=$'\033[36m'
   C_CYAN_BOLD=$'\033[1;36m'
+  C_RED=$'\033[31m'
   C_GRAY=$'\033[90m'   # gray (37 在深色终端里和默认白字几乎一样)
   C_RESET=$'\033[0m'
 else
-  C_DIM="" C_BOLD="" C_GREEN="" C_GREEN_BOLD="" C_CYAN="" C_CYAN_BOLD="" C_GRAY="" C_RESET=""
+  C_DIM="" C_BOLD="" C_GREEN="" C_GREEN_BOLD="" C_CYAN="" C_CYAN_BOLD="" C_RED="" C_GRAY="" C_RESET=""
 fi
 
 die() {
@@ -31,8 +32,12 @@ usage() {
   tag              显示各格式当前最高版本
   tag next         在 latest 上补丁号 +1 并推送
   tag next dev     在指定渠道上补丁号 +1 并推送
-  tag 1.11.11      git tag 1.11.11 && git push --tags && date
+  tag 1.11.11      git tag 1.11.11 && git push && 跟踪远程打包
   tag -h           显示帮助
+
+环境变量:
+  GITLAB_TOKEN     GitLab 私人令牌，推送后跟踪 CI 打包进度
+  TAG_WATCH=0      跳过远程打包跟踪
 EOF
 }
 
@@ -164,6 +169,545 @@ remote_has_tag() {
   [ -n "$(git ls-remote --refs --tags "$remote" "refs/tags/$version" 2>/dev/null || true)" ]
 }
 
+pack_token() {
+  local kind="$1"
+  case "$kind" in
+    gitlab)
+      if [ -n "${GITLAB_TOKEN:-}${GITLAB_PRIVATE_TOKEN:-}${PRIVATE_TOKEN:-}" ]; then
+        echo "${GITLAB_TOKEN:-${GITLAB_PRIVATE_TOKEN:-$PRIVATE_TOKEN}}"
+        return
+      fi
+      git config --get gitlab.token 2>/dev/null || true
+      ;;
+    gitee)
+      if [ -n "${GITEE_TOKEN:-}${GITEE_ACCESS_TOKEN:-}" ]; then
+        echo "${GITEE_TOKEN:-$GITEE_ACCESS_TOKEN}"
+        return
+      fi
+      git config --get gitee.token 2>/dev/null || true
+      ;;
+    github)
+      if [ -n "${GITHUB_TOKEN:-}${GH_TOKEN:-}" ]; then
+        echo "${GITHUB_TOKEN:-$GH_TOKEN}"
+        return
+      fi
+      git config --get github.token 2>/dev/null || true
+      ;;
+  esac
+}
+
+parse_remote_repo() {
+  local remote url path scheme=https cfg
+  remote=$(primary_remote)
+  [ -n "$remote" ] || return 1
+  url=$(git remote get-url "$remote")
+  url="${url%.git}"
+  url="${url%/}"
+  if [[ "$url" =~ ^git@([^:]+):(.+)$ ]]; then
+    _host="${BASH_REMATCH[1]}"
+    path="${BASH_REMATCH[2]}"
+  elif [[ "$url" =~ ^ssh://([^@]+@)?([^/]+)/(.+)$ ]]; then
+    _host="${BASH_REMATCH[2]}"
+    path="${BASH_REMATCH[3]}"
+  elif [[ "$url" =~ ^https?://([^/]+)/(.+)$ ]]; then
+    _host="${BASH_REMATCH[1]}"
+    path="${BASH_REMATCH[2]}"
+    [[ "$url" == http://* ]] && scheme=http
+  else
+    return 1
+  fi
+  _project="$path"
+  _base="$scheme://$_host"
+  cfg=$(git config --get gitlab.url 2>/dev/null || true)
+  [ -n "$cfg" ] && _base="${cfg%/}"
+  case "$_host" in
+    *gitee.com*) _kind=gitee ;;
+    *github.com*) _kind=github ;;
+    *) _kind=gitlab ;;
+  esac
+}
+
+pack_probe() {
+  python - "$1" "$2" "$3" "$4" "$5" "$6" <<'PY'
+import json, ssl, sys, urllib.error, urllib.parse, urllib.request
+from datetime import datetime, timezone
+
+kind, base, project, sha, tag, token = sys.argv[1:7]
+INSECURE = ssl._create_unverified_context()
+
+def fetch(url, headers=None, insecure=False):
+    req = urllib.request.Request(url, headers=headers or {"User-Agent": "tag-cli"})
+    ctx = INSECURE if insecure else None
+    try:
+        with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+            return resp.status, json.load(resp)
+    except urllib.error.HTTPError as err:
+        try:
+            data = json.loads(err.read().decode("utf-8", "replace"))
+        except Exception:
+            data = {}
+        return err.code, data
+    except Exception:
+        return 0, {}
+
+def emit(state, pack=("pending", 0, 0), deploy=("pending", 0, 0)):
+    print("%s\t%s\t%s\t%s\t%s\t%s\t%s" % (
+        state, pack[0], pack[1], pack[2], deploy[0], deploy[1], deploy[2]
+    ))
+    sys.exit(0)
+
+def gitee(path):
+    url = "https://gitee.com/api/v5" + path
+    url += ("&" if "?" in url else "?") + "access_token=" + urllib.parse.quote(token)
+    return fetch(url)
+
+def github(path):
+    return fetch(
+        "https://api.github.com" + path,
+        {
+            "Authorization": "Bearer " + token,
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "tag-cli",
+        },
+    )
+
+def gitlab(path):
+    url = base.rstrip("/") + "/api/v4" + path
+    return fetch(url, {"PRIVATE-TOKEN": token, "User-Agent": "tag-cli"}, insecure=True)
+
+def job_secs(job):
+    d = job.get("duration")
+    if d is not None:
+        try:
+            return max(0, int(float(d)))
+        except Exception:
+            pass
+    started = job.get("started_at")
+    if not started:
+        return 0
+    try:
+        if started.endswith("Z"):
+            started = started[:-1] + "+00:00"
+        t0 = datetime.fromisoformat(started)
+        if t0.tzinfo is None:
+            t0 = t0.replace(tzinfo=timezone.utc)
+        return max(0, int((datetime.now(timezone.utc) - t0).total_seconds()))
+    except Exception:
+        return 0
+
+def is_deploy_job(job):
+    blob = "%s %s" % (job.get("stage") or "", job.get("name") or "")
+    low = blob.lower()
+    for key in ("deploy", "release", "publish", "install", "rollout", "交付"):
+        if key in low:
+            return True
+    return "部署" in blob
+
+def split_jobs(jobs):
+    pack, deploy = [], []
+    stages = []
+    for job in jobs:
+        stage = job.get("stage") or ""
+        if stage not in stages:
+            stages.append(stage)
+        if is_deploy_job(job):
+            deploy.append(job)
+        else:
+            pack.append(job)
+    if not deploy and len(stages) >= 2:
+        last = stages[-1]
+        pack, deploy = [], []
+        for job in jobs:
+            if (job.get("stage") or "") == last:
+                deploy.append(job)
+            else:
+                pack.append(job)
+    elif not deploy and len(jobs) >= 2:
+        pack, deploy = jobs[:1], jobs[1:]
+    return pack, deploy
+
+def summarize(jobs):
+    if not jobs:
+        return ("pending", 0, 0)
+    total = len(jobs)
+    done = failed = running = pending = 0
+    secs = 0
+    for job in jobs:
+        js = (job.get("status") or "").lower()
+        secs += job_secs(job)
+        if js in ("success", "failed", "canceled", "skipped"):
+            done += 1
+        if js == "failed":
+            failed += 1
+        elif js == "running":
+            running += 1
+        elif js in ("created", "pending", "waiting_for_resource", "preparing", "scheduled", "manual"):
+            pending += 1
+    pct = int(done * 100 / total) if total else 0
+    if failed and not running:
+        return ("failure", 100, secs)
+    if running:
+        return ("running", pct, secs)
+    if pending and done < total:
+        return ("pending", pct, secs)
+    if done == total:
+        return ("failure" if failed else "success", 100, secs)
+    return ("pending", pct, secs)
+
+pending = running = success = failure = False
+details = []
+files = []
+saw = False
+pct = 0
+pack_sum = ("pending", 0, 0)
+deploy_sum = ("pending", 0, 0)
+
+if kind == "gitlab":
+    pid = urllib.parse.quote(project, safe="")
+    q = urllib.parse.urlencode({"ref": tag, "sha": sha, "per_page": 5})
+    code, data = gitlab("/projects/%s/pipelines?%s" % (pid, q))
+    if code in (401, 403):
+        emit("auth")
+    if code != 200 or not data:
+        q = urllib.parse.urlencode({"ref": tag, "per_page": 5})
+        code, data = gitlab("/projects/%s/pipelines?%s" % (pid, q))
+        if code in (401, 403):
+            emit("auth")
+    if code == 200 and data:
+        pipe = data[0]
+        saw = True
+        st = (pipe.get("status") or "").lower()
+        code, jobs = gitlab("/projects/%s/pipelines/%s/jobs?per_page=100" % (pid, pipe["id"]))
+        if code != 200 or not isinstance(jobs, list):
+            jobs = []
+        jobs.sort(key=lambda j: j.get("id") or 0)
+        pack_jobs, deploy_jobs = split_jobs(jobs)
+        pack_sum = summarize(pack_jobs)
+        deploy_sum = summarize(deploy_jobs)
+        if st in ("created", "waiting_for_resource", "preparing", "pending", "scheduled"):
+            pending = True
+        elif st == "running":
+            running = True
+        elif st == "success":
+            success = True
+        elif st in ("failed", "canceled"):
+            failure = True
+        if pack_sum[0] == "failure" or deploy_sum[0] == "failure":
+            failure = True
+        if pack_sum[0] == "running" or deploy_sum[0] == "running":
+            running = True
+        if pack_sum[0] == "pending" or deploy_sum[0] == "pending":
+            pending = True
+        if pack_sum[0] == "success":
+            success = True
+        code, rel = gitlab("/projects/%s/releases/%s" % (pid, urllib.parse.quote(tag, safe="")))
+        if code == 200 and isinstance(rel, dict):
+            for link in (rel.get("assets") or {}).get("links") or []:
+                name = link.get("name") or link.get("url")
+                if name:
+                    files.append(name)
+        code, pkgs = gitlab("/projects/%s/packages?per_page=10&%s" % (
+            pid, urllib.parse.urlencode({"package_version": tag})
+        ))
+        if code == 200 and isinstance(pkgs, list):
+            for pkg in pkgs:
+                name = pkg.get("name") or ""
+                ver = pkg.get("version") or ""
+                label = "%s%s" % (name, " " + ver if ver else "")
+                if label.strip():
+                    files.append(label.strip())
+    else:
+        emit("none")
+
+elif kind == "gitee":
+    owner, repo = project.split("/", 1)
+    code, data = gitee("/repos/%s/%s/commits/%s/check-runs" % (owner, repo, sha))
+    if code in (401, 403):
+        emit("auth")
+    if code == 200:
+        for item in data.get("check_runs") or []:
+            saw = True
+            status = (item.get("status") or "").lower()
+            conclusion = (item.get("conclusion") or "").lower()
+            name = item.get("name") or "检查"
+            if status in ("queued", "waiting"):
+                pending = True
+                details.append(name)
+            elif status == "in_progress":
+                running = True
+                details.append(name)
+            elif conclusion in ("failure", "timed_out", "cancelled", "action_required"):
+                failure = True
+                details.append(name)
+            elif conclusion in ("success", "neutral", "skipped"):
+                success = True
+            else:
+                pending = True
+                details.append(name)
+    code, data = gitee("/repos/%s/%s/commits/%s/statuses" % (owner, repo, sha))
+    if code == 200:
+        items = data if isinstance(data, list) else data.get("statuses") or []
+        for item in items:
+            saw = True
+            state = (item.get("state") or "").lower()
+            name = item.get("context") or item.get("description") or "状态"
+            if state == "pending":
+                pending = True
+                details.append(name)
+            elif state in ("error", "failure"):
+                failure = True
+                details.append(name)
+            elif state == "success":
+                success = True
+    code, rel = gitee("/repos/%s/%s/releases/tags/%s" % (
+        owner, repo, urllib.parse.quote(tag, safe="")
+    ))
+    if code == 200 and isinstance(rel, dict) and rel.get("id"):
+        saw = True
+        pending = True
+        rid = rel["id"]
+        code, assets = gitee("/repos/%s/%s/releases/%d/attach_files" % (owner, repo, rid))
+        if code == 200:
+            items = assets if isinstance(assets, list) else assets.get("attach_files") or assets.get("assets") or []
+            for item in items:
+                name = item.get("name") or item.get("file_name")
+                if name:
+                    files.append(name)
+            if files:
+                success = True
+                pending = False
+
+elif kind == "github":
+    owner, repo = project.split("/", 1)
+    code, data = github("/repos/%s/%s/commits/%s/check-runs" % (owner, repo, sha))
+    if code in (401, 403):
+        emit("auth")
+    if code == 200:
+        for item in data.get("check_runs") or []:
+            saw = True
+            status = (item.get("status") or "").lower()
+            conclusion = (item.get("conclusion") or "").lower()
+            name = item.get("name") or "检查"
+            if status in ("queued", "waiting", "pending", "requested"):
+                pending = True
+                details.append(name)
+            elif status == "in_progress":
+                running = True
+                details.append(name)
+            elif conclusion in ("failure", "timed_out", "cancelled", "action_required"):
+                failure = True
+                details.append(name)
+            elif conclusion in ("success", "neutral", "skipped"):
+                success = True
+    code, data = github("/repos/%s/%s/commits/%s/status" % (owner, repo, sha))
+    if code == 200:
+        state = (data.get("state") or "").lower()
+        if state == "pending":
+            saw = True
+            pending = True
+        elif state in ("error", "failure"):
+            saw = True
+            failure = True
+        elif state == "success":
+            saw = True
+            success = True
+    code, data = github("/repos/%s/%s/actions/runs?per_page=8" % (owner, repo))
+    if code == 200:
+        for item in data.get("workflow_runs") or []:
+            if item.get("head_sha") != sha and item.get("head_branch") != tag:
+                continue
+            saw = True
+            status = (item.get("status") or "").lower()
+            conclusion = (item.get("conclusion") or "").lower()
+            name = item.get("name") or "工作流"
+            if status in ("queued", "waiting", "pending", "requested"):
+                pending = True
+                details.append(name)
+            elif status == "in_progress":
+                running = True
+                details.append(name)
+            elif conclusion in ("failure", "timed_out", "cancelled"):
+                failure = True
+                details.append(name)
+            elif conclusion == "success":
+                success = True
+    code, rel = github("/repos/%s/%s/releases/tags/%s" % (
+        owner, repo, urllib.parse.quote(tag, safe="")
+    ))
+    if code == 200 and isinstance(rel, dict):
+        for item in rel.get("assets") or []:
+            name = item.get("name")
+            if name:
+                files.append(name)
+        if files:
+            saw = True
+            success = True
+
+if not saw:
+    emit("none")
+elif failure and not running and not pending:
+    overall = "failure"
+elif running:
+    overall = "running"
+elif pending:
+    overall = "pending"
+elif success:
+    overall = "success"
+else:
+    overall = "none"
+
+if kind != "gitlab":
+    pack_sum = (overall if overall != "none" else "pending", 100 if overall in ("success", "failure") else pct, 0)
+    deploy_sum = ("pending", 0, 0)
+emit(overall, pack_sum, deploy_sum)
+PY
+}
+
+fill_bar() {
+  local state="$1" percent="${2:-0}" bounce="${3:-0}" width=12 i pos fill
+  _bar=""
+  case "$percent" in
+    ''|*[!0-9]*) percent=0 ;;
+  esac
+  case "$bounce" in
+    ''|*[!0-9]*) bounce=0 ;;
+  esac
+  case "$state" in
+    pending)
+      pos=$((bounce % (width - 3)))
+      for ((i = 0; i < width; i++)); do
+        if [ "$i" -ge "$pos" ] && [ "$i" -lt $((pos + 4)) ]; then
+          _bar+="#"
+        else
+          _bar+="-"
+        fi
+      done
+      ;;
+    running)
+      fill=$((percent * width / 100))
+      [ "$fill" -lt 1 ] && fill=1
+      for ((i = 0; i < width; i++)); do
+        if [ "$i" -lt "$fill" ]; then
+          _bar+="#"
+        else
+          _bar+="-"
+        fi
+      done
+      ;;
+    success|failure)
+      for ((i = 0; i < width; i++)); do
+        _bar+="#"
+      done
+      ;;
+    *)
+      for ((i = 0; i < width; i++)); do
+        _bar+="-"
+      done
+      ;;
+  esac
+}
+
+print_phase_line() {
+  local label="$1" state="$2" percent="$3" secs="$4" bounce="$5" color
+  case "$state" in
+    pending) color="$C_GRAY" ;;
+    running) color="$C_CYAN" ;;
+    success) color="$C_GREEN" ;;
+    failure) color="$C_RED" ;;
+    *) color="$C_GRAY" ;;
+  esac
+  case "$secs" in
+    ''|*[!0-9]*) secs=0 ;;
+  esac
+  fill_bar "$state" "$percent" "$bounce"
+  printf '%s%s%s  [%s%s%s] %ss' "$color" "$label" "$C_RESET" "$color" "$_bar" "$C_RESET" "$secs"
+}
+
+draw_two_phases() {
+  local pack_state="$1" pack_pct="$2" pack_sec="$3"
+  local deploy_state="$4" deploy_pct="$5" deploy_sec="$6"
+  local bounce="${7:-0}"
+  if [ -t 1 ] && [ "${_pack_ui_drawn:-0}" = 1 ]; then
+    printf '\033[2A\r\033[K'
+    print_phase_line "打包" "$pack_state" "$pack_pct" "$pack_sec" "$bounce"
+    printf '\n\r\033[K'
+    print_phase_line "部署" "$deploy_state" "$deploy_pct" "$deploy_sec" "$bounce"
+    printf '\n'
+  else
+    print_phase_line "打包" "$pack_state" "$pack_pct" "$pack_sec" "$bounce"
+    printf '\n'
+    print_phase_line "部署" "$deploy_state" "$deploy_pct" "$deploy_sec" "$bounce"
+    printf '\n'
+    _pack_ui_drawn=1
+  fi
+}
+
+watch_remote_pack() {
+  local version="$1"
+  local token sha state="" elapsed=0 last=""
+  local p_st=pending p_pct=0 p_sec=0 d_st=pending d_pct=0 d_sec=0
+  local detect_limit timeout_limit
+  _pack_ui_drawn=0
+
+  [ "${TAG_WATCH:-1}" = "0" ] && return 0
+  command -v python >/dev/null 2>&1 || return 0
+  parse_remote_repo || return 0
+  token=$(pack_token "$_kind")
+  if [ -z "$token" ]; then
+    printf '%s未跟踪远程打包（设置 GITLAB_TOKEN 后可显示进度）%s\n' "$C_GRAY" "$C_RESET"
+    return 0
+  fi
+
+  sha=$(git rev-parse "${version}^{commit}" 2>/dev/null) || sha=$(git rev-parse "$version")
+  detect_limit="${TAG_WATCH_DETECT:-20}"
+  timeout_limit="${TAG_WATCH_TIMEOUT:-600}"
+
+  while [ "$elapsed" -le "$timeout_limit" ]; do
+    last=$(pack_probe "$_kind" "$_base" "$_project" "$sha" "$version" "$token" || true)
+    IFS=$'\t' read -r state p_st p_pct p_sec d_st d_pct d_sec <<<"$last"
+    [ -z "$state" ] && state=none
+
+    case "$state" in
+      auth)
+        printf '%s远程打包跟踪失败：令牌无效或没有权限%s\n' "$C_GRAY" "$C_RESET"
+        return 0
+        ;;
+      none)
+        if [ "$elapsed" -ge "$detect_limit" ]; then
+          if [ -t 1 ] && [ "${_pack_ui_drawn:-0}" = 1 ]; then
+            printf '\033[2A\r\033[K\n\r\033[K\033[1A'
+          elif [ -t 1 ]; then
+            printf '\r\033[K'
+          fi
+          printf '%s未检测到远程打包%s\n' "$C_GRAY" "$C_RESET"
+          return 0
+        fi
+        draw_two_phases pending 0 0 pending 0 0 "$elapsed"
+        ;;
+      pending|running|success|failure)
+        draw_two_phases "${p_st:-pending}" "${p_pct:-0}" "${p_sec:-0}" \
+          "${d_st:-pending}" "${d_pct:-0}" "${d_sec:-0}" "$elapsed"
+        if [ "$state" = "success" ]; then
+          return 0
+        fi
+        if [ "$state" = "failure" ]; then
+          die "远程打包失败"
+        fi
+        ;;
+    esac
+
+    sleep 2
+    elapsed=$((elapsed + 2))
+  done
+
+  if [ -t 1 ] && [ "${_pack_ui_drawn:-0}" = 1 ]; then
+    printf '\033[2A\r\033[K\n\r\033[K\033[1A'
+  elif [ -t 1 ]; then
+    printf '\r\033[K'
+  fi
+  printf '%s远程打包超时（%ss）%s\n' "$C_GRAY" "$timeout_limit" "$C_RESET"
+}
+
 print_push_line() {
   local line="$1" name
   line="${line%$'\r'}"
@@ -197,6 +741,7 @@ create_and_push() {
     print_push_line "$line"
   done
   [ "${PIPESTATUS[0]}" -eq 0 ]
+  watch_remote_pack "$version"
   printf '%s' "$C_GRAY"
   date
   printf '%s' "$C_RESET"
