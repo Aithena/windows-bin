@@ -7,6 +7,19 @@
 
 set -eu
 
+if [ -t 1 ]; then
+  C_DIM=$'\033[2m'
+  C_BOLD=$'\033[1m'
+  C_GREEN=$'\033[32m'
+  C_GREEN_BOLD=$'\033[1;32m'
+  C_CYAN=$'\033[36m'
+  C_CYAN_BOLD=$'\033[1;36m'
+  C_GRAY=$'\033[90m'   # gray (37 在深色终端里和默认白字几乎一样)
+  C_RESET=$'\033[0m'
+else
+  C_DIM="" C_BOLD="" C_GREEN="" C_GREEN_BOLD="" C_CYAN="" C_CYAN_BOLD="" C_GRAY="" C_RESET=""
+fi
+
 die() {
   echo "$*" >&2
   exit 1
@@ -63,19 +76,11 @@ channel_of() {
 show_max_tags() {
   need_git
 
-  local tags tag family channel dim bold reset
+  local tags tag family channel
   tags=$(git tag --list --sort=-v:refname || true)
   if [ -z "$tags" ]; then
     echo "no tags"
     return
-  fi
-
-  if [ -t 1 ]; then
-    dim=$'\033[2m'
-    bold=$'\033[1m'
-    reset=$'\033[0m'
-  else
-    dim="" bold="" reset=""
   fi
 
   unset seen_families 2>/dev/null || true
@@ -86,7 +91,11 @@ show_max_tags() {
     if [ -z "${seen_families[$family]+x}" ]; then
       seen_families[$family]=1
       channel=$(channel_of "$family")
-      printf '  %s%-8s%s %s%s%s\n' "$dim" "$channel" "$reset" "$bold" "$tag" "$reset"
+      if [ "$channel" = "latest" ]; then
+        printf '  %s%-8s%s %s%s%s\n' "$C_GREEN" "$channel" "$C_RESET" "$C_GREEN_BOLD" "$tag" "$C_RESET"
+      else
+        printf '  %s%-8s%s %s%s%s\n' "$C_DIM" "$channel" "$C_RESET" "$C_BOLD" "$tag" "$C_RESET"
+      fi
     fi
   done <<EOF
 $tags
@@ -128,6 +137,17 @@ EOF
   return 1
 }
 
+print_push_line() {
+  local line="$1" name
+  line="${line%$'\r'}"
+  if [[ "$line" =~ \[new\ tag\][[:space:]]+([^[:space:]]+) ]]; then
+    name="${BASH_REMATCH[1]}"
+    printf '%s%s%s    %s✓%s\n' "$C_CYAN_BOLD" "$name" "$C_RESET" "$C_CYAN" "$C_RESET"
+  else
+    printf '%s\n' "$line"
+  fi
+}
+
 create_and_push() {
   local version="$1"
   need_git
@@ -139,8 +159,13 @@ create_and_push() {
   echo "git tag $version"
   git tag "$version"
   echo "git push --tags"
-  git push --tags
+  git push --tags 2>&1 | while IFS= read -r line || [ -n "$line" ]; do
+    print_push_line "$line"
+  done
+  [ "${PIPESTATUS[0]}" -eq 0 ]
+  printf '%s' "$C_GRAY"
   date
+  printf '%s' "$C_RESET"
 }
 
 do_next() {

@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# 用法:
+#   untag            列出所有 tag
+#   untag 1.11.11    删除本地和远程 tag
+
+set -eu
+
+if [ -t 1 ]; then
+  C_DIM=$'\033[2m'
+  C_CYAN=$'\033[36m'
+  C_CYAN_BOLD=$'\033[1;36m'
+  C_GRAY=$'\033[90m'
+  C_RESET=$'\033[0m'
+else
+  C_DIM="" C_CYAN="" C_CYAN_BOLD="" C_GRAY="" C_RESET=""
+fi
+
+die() {
+  echo "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+用法:
+  untag            列出所有 tag
+  untag 1.11.11    删除本地和远程 tag
+  untag -h         显示帮助
+EOF
+}
+
+need_git() {
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "当前目录不是 git 仓库"
+}
+
+primary_remote() {
+  if git remote | grep -qx origin; then
+    echo origin
+    return
+  fi
+  git remote | head -n1
+}
+
+tag_exists_local() {
+  git rev-parse -q --verify "refs/tags/$1" >/dev/null
+}
+
+tag_exists_remote() {
+  local remote="$1" version="$2"
+  [ -n "$(git ls-remote --tags "$remote" "refs/tags/$version" 2>/dev/null || true)" ]
+}
+
+print_push_line() {
+  local line="$1" name
+  line="${line%$'\r'}"
+  if [[ "$line" =~ \[deleted\][[:space:]]+([^[:space:]]+) ]]; then
+    name="${BASH_REMATCH[1]}"
+    printf '%s%s%s    %s✓%s\n' "$C_CYAN_BOLD" "$name" "$C_RESET" "$C_CYAN" "$C_RESET"
+  else
+    printf '%s\n' "$line"
+  fi
+}
+
+show_tags() {
+  need_git
+
+  local tags tag
+  tags=$(git tag --list --sort=-v:refname || true)
+  if [ -z "$tags" ]; then
+    echo "no tags"
+    return
+  fi
+
+  while IFS= read -r tag; do
+    [ -z "$tag" ] && continue
+    printf '  %s%s%s\n' "$C_DIM" "$tag" "$C_RESET"
+  done <<EOF
+$tags
+EOF
+}
+
+do_untag() {
+  local version="$1"
+  local remote local_ok=0 remote_ok=0
+  need_git
+
+  if tag_exists_local "$version"; then
+    local_ok=1
+  fi
+
+  remote=$(primary_remote || true)
+  if [ -n "$remote" ] && tag_exists_remote "$remote" "$version"; then
+    remote_ok=1
+  fi
+
+  if [ "$local_ok" -eq 0 ] && [ "$remote_ok" -eq 0 ]; then
+    die "tag $version 不存在"
+  fi
+
+  if [ "$local_ok" -eq 1 ]; then
+    echo "git tag -d $version"
+    git tag -d "$version"
+  fi
+
+  if [ "$remote_ok" -eq 1 ]; then
+    echo "git push $remote --delete $version"
+    git push "$remote" --delete "$version" 2>&1 | while IFS= read -r line || [ -n "$line" ]; do
+      print_push_line "$line"
+    done
+    [ "${PIPESTATUS[0]}" -eq 0 ]
+  else
+    printf '%s%s%s    %s✓%s\n' "$C_CYAN_BOLD" "$version" "$C_RESET" "$C_CYAN" "$C_RESET"
+  fi
+
+  printf '%s' "$C_GRAY"
+  date
+  printf '%s' "$C_RESET"
+}
+
+case "${1:-}" in
+  ""|-l)
+    show_tags
+    ;;
+  -h|--help)
+    usage
+    ;;
+  -*)
+    die "未知参数: $1
+$(usage)"
+    ;;
+  *)
+    if [ "$#" -ne 1 ]; then
+      die "一次只接收一个版本号
+$(usage)"
+    fi
+    do_untag "$1"
+    ;;
+esac
