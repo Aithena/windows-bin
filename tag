@@ -774,7 +774,7 @@ watch_remote_pack() {
         if [ "$state" = "failure" ]; then
           trap - EXIT
           cleanup_watch
-          die "远程打包失败"
+          die "${C_RED}远程打包失败${C_RESET}"
         fi
         ;;
     esac
@@ -808,7 +808,7 @@ print_image_line() {
   elif command -v clip.exe >/dev/null 2>&1; then
     printf '%s' "$image" | clip.exe
   fi
-  printf '%s%s镜像%s  %s%s%s\n' "$C_RESET" "$C_GRAY" "$C_RESET" "$C_GREEN" "$image" "$C_RESET"
+  printf '%s镜像  %s%s\n' "$C_GREEN" "$image" "$C_RESET"
 }
 
 print_push_line() {
