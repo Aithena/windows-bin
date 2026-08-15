@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # 用法:
-#   tag              显示各格式当前最高版本
+#   tag              显示各渠道当前最高版本
 #   tag next         在 latest 上补丁号 +1 并推送
 #   tag next dev     在指定渠道上补丁号 +1 并推送
-#   tag 1.11.11      git tag 1.11.11 && git push && 跟踪远程打包
+#   tag 1.1.1        git push && git tag && 跟踪远程打包
 
 set -eu
 
@@ -29,15 +29,16 @@ die() {
 usage() {
   cat <<'EOF'
 用法:
-  tag              显示各格式当前最高版本
+  tag              显示各渠道当前最高版本
   tag next         在 latest 上补丁号 +1 并推送
-  tag next dev     在指定渠道上补丁号 +1 并推送
-  tag 1.11.11      git tag 1.11.11 && git push && 跟踪远程打包
-  tag -h           显示帮助
+  tag next dev     在指定渠道上补丁号 +1 并推送（dev / pre / test）
+  tag 1.1.1        打指定版本（1.1.1 / 1.1.1-dev / 1.1.1-pre / 1.1.1-test）
+  tag help         显示帮助
 
 环境变量:
   GITLAB_TOKEN     GitLab 私人令牌，推送后跟踪 CI 打包进度
   TAG_WATCH=0      跳过远程打包跟踪
+  DOCKER_REGISTRY  镜像仓库主机，默认 docker-registry.kangyishou.com
 EOF
 }
 
@@ -767,6 +768,7 @@ watch_remote_pack() {
         if [ "$state" = "success" ]; then
           trap - EXIT
           cleanup_watch
+          print_image_line "$version"
           return 0
         fi
         if [ "$state" = "failure" ]; then
@@ -790,6 +792,25 @@ watch_remote_pack() {
   printf '%s远程打包超时（%ss）%s\n' "$C_GRAY" "$timeout_limit" "$C_RESET"
 }
 
+print_image_line() {
+  local version="$1" registry project image
+  [ -n "${_project:-}" ] || return 0
+  registry="${DOCKER_REGISTRY:-}"
+  if [ -z "$registry" ]; then
+    registry=$(git config --get docker.registry 2>/dev/null || true)
+  fi
+  [ -z "$registry" ] && registry=docker-registry.kangyishou.com
+  project="${_project#/}"
+  project="${project%/}"
+  image="$registry/$project:$version"
+  if [ -c /dev/clipboard ]; then
+    printf '%s' "$image" > /dev/clipboard
+  elif command -v clip.exe >/dev/null 2>&1; then
+    printf '%s' "$image" | clip.exe
+  fi
+  printf '%s%s镜像%s  %s%s%s\n' "$C_RESET" "$C_GRAY" "$C_RESET" "$C_GREEN" "$image" "$C_RESET"
+}
+
 print_push_line() {
   local line="$1" name
   line="${line%$'\r'}"
@@ -803,7 +824,7 @@ print_push_line() {
 
 create_and_push() {
   local version="$1"
-  local remote
+  local remote branch
   need_git
 
   if git rev-parse -q --verify "refs/tags/$version" >/dev/null; then
@@ -815,7 +836,10 @@ create_and_push() {
 
   remote=$(primary_remote)
   [ -n "$remote" ] || die "没有 git remote"
+  branch=$(git symbolic-ref --short HEAD 2>/dev/null) || die "当前不在分支上，无法推送本地提交"
 
+  echo "git push $remote $branch"
+  git push "$remote" "$branch"
   echo "git tag $version"
   git tag "$version"
   echo "git push $remote $version"
@@ -860,12 +884,19 @@ case "${1:-}" in
     show_max_tags
     ;;
   next)
-    if [ "$#" -gt 2 ]; then
-      die "用法: tag next [渠道]"
+    if [ "$#" -eq 1 ]; then
+      do_next latest
+    elif [ "$#" -eq 2 ]; then
+      case "$2" in
+        dev|pre|test) do_next "$2" ;;
+        *) die "未知渠道: $2
+用法: tag next [dev|pre|test]" ;;
+      esac
+    else
+      die "用法: tag next [dev|pre|test]"
     fi
-    do_next "${2:-latest}"
     ;;
-  -h|--help)
+  help|-h|--help)
     usage
     ;;
   -*)
@@ -877,6 +908,15 @@ $(usage)"
       die "一次只接收一个版本号
 $(usage)"
     fi
-    create_and_push "$1"
+    if [[ "$1" =~ ^[0-9] ]]; then
+      if [[ ! "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-(dev|pre|test))?$ ]]; then
+        die "版本号必须是 1.1.1 或 1.1.1-dev|pre|test"
+      fi
+      create_and_push "$1"
+    else
+      die "未知命令: $1
+用法: tag next [dev|pre|test]
+     tag 1.1.1[-dev|-pre|-test]"
+    fi
     ;;
 esac
