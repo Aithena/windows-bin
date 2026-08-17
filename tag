@@ -624,7 +624,7 @@ print_phase_line() {
     ''|*[!0-9]*) secs=0 ;;
   esac
   fill_bar "$state" "$percent" "$bounce"
-  printf '%s%s%s  [%s%s%s] %ss' "$color" "$label" "$C_RESET" "$color" "$_bar" "$C_RESET" "$secs"
+  printf '%s%s  [%s] %ss%s' "$color" "$label" "$_bar" "$secs" "$C_RESET"
 }
 
 draw_two_phases() {
