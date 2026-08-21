@@ -9,16 +9,14 @@ set -eu
 
 if [ -t 1 ]; then
   C_DIM=$'\033[2m'
-  C_BOLD=$'\033[1m'
   C_GREEN=$'\033[32m'
-  C_GREEN_BOLD=$'\033[1;32m'
   C_CYAN=$'\033[36m'
   C_CYAN_BOLD=$'\033[1;36m'
   C_RED=$'\033[31m'
   C_GRAY=$'\033[90m'   # gray (37 在深色终端里和默认白字几乎一样)
   C_RESET=$'\033[0m'
 else
-  C_DIM="" C_BOLD="" C_GREEN="" C_GREEN_BOLD="" C_CYAN="" C_CYAN_BOLD="" C_RED="" C_GRAY="" C_RESET=""
+  C_DIM="" C_GREEN="" C_CYAN="" C_CYAN_BOLD="" C_RED="" C_GRAY="" C_RESET=""
 fi
 
 die() {
@@ -33,7 +31,7 @@ usage() {
   tag next         在 latest 上补丁号 +1 并推送
   tag next dev     在指定渠道上补丁号 +1 并推送（dev / pre / test）
   tag 1.1.1        打指定版本（1.1.1 / 1.1.1-dev / 1.1.1-pre / 1.1.1-test）
-  tag help         显示帮助
+  tag -h           显示帮助
 
 环境变量:
   GITLAB_TOKEN     GitLab 私人令牌，推送后跟踪 CI 打包进度
@@ -106,9 +104,9 @@ show_max_tags() {
       seen_families[$_family]=1
       channel_of "$_family"
       if [ "$_channel" = "latest" ]; then
-        printf '  %s%-8s%s %s%s%s\n' "$C_GREEN" "$_channel" "$C_RESET" "$C_GREEN_BOLD" "$tag" "$C_RESET"
+        printf '  %s%-8s %s%s\n' "$C_GREEN" "$_channel" "$tag" "$C_RESET"
       else
-        printf '  %s%-8s%s %s%s%s\n' "$C_DIM" "$_channel" "$C_RESET" "$C_BOLD" "$tag" "$C_RESET"
+        printf '  %s%-8s %s%s\n' "$C_DIM" "$_channel" "$tag" "$C_RESET"
       fi
     fi
   done < <(each_tag_desc)
@@ -896,7 +894,7 @@ case "${1:-}" in
       die "用法: tag next [dev|pre|test]"
     fi
     ;;
-  help|-h|--help)
+  -h|--help)
     usage
     ;;
   -*)
