@@ -31,6 +31,7 @@ usage() {
   tag next         在 latest 上补丁号 +1 并推送
   tag next dev     在指定渠道上补丁号 +1 并推送（dev / pre / test）
   tag 1.1.1        打指定版本（1.1.1 / 1.1.1-dev / 1.1.1-pre / 1.1.1-test）
+  tag doctor       看当前仓库监测配置，以及换 GitLab 要给什么
   tag -h           显示帮助
 
 环境变量:
@@ -41,6 +42,8 @@ usage() {
 Git 配置:
   gitlab.token              默认 GitLab 令牌
   gitlab.<host>.token       指定主机的令牌，例如 gitlab.git.jwyun.net.token
+  gitlab.url                GitLab 网页/API 和 git 主机不同时才需要
+  docker.registry           打包成功后复制的镜像主机
 EOF
 }
 
@@ -879,6 +882,79 @@ print_push_line() {
   fi
 }
 
+token_source() {
+  case "${_kind:-gitlab}" in
+    github)
+      if [ -n "${GITHUB_TOKEN:-}${GH_TOKEN:-}" ]; then
+        echo "环境变量 GITHUB_TOKEN"
+      elif git config --get github.token >/dev/null 2>&1; then
+        echo "git config github.token"
+      else
+        echo "未配置"
+      fi
+      ;;
+    gitee)
+      if [ -n "${GITEE_TOKEN:-}${GITEE_ACCESS_TOKEN:-}" ]; then
+        echo "环境变量 GITEE_TOKEN"
+      elif git config --get gitee.token >/dev/null 2>&1; then
+        echo "git config gitee.token"
+      else
+        echo "未配置"
+      fi
+      ;;
+    *)
+      if [ -n "${GITLAB_TOKEN:-}${GITLAB_PRIVATE_TOKEN:-}${PRIVATE_TOKEN:-}" ]; then
+        echo "环境变量 GITLAB_TOKEN（会覆盖所有主机）"
+      elif [ -n "${_host:-}" ] && git config --get "gitlab.${_host}.token" >/dev/null 2>&1; then
+        echo "git config gitlab.${_host}.token"
+      elif git config --get gitlab.token >/dev/null 2>&1; then
+        echo "git config gitlab.token（全局默认，可能是旧公司）"
+      else
+        echo "未配置"
+      fi
+      ;;
+  esac
+}
+
+show_doctor() {
+  local remote url registry
+  need_git
+  parse_remote_repo || die "无法从 git remote 解析仓库地址"
+  remote=$(primary_remote)
+  url=$(git remote get-url "$remote")
+  registry="${DOCKER_REGISTRY:-}"
+  if [ -z "$registry" ]; then
+    registry=$(git config --get docker.registry 2>/dev/null || true)
+  fi
+  if [ -z "$registry" ]; then
+    registry="docker-registry.kangyishou.com（默认，换公司通常要改）"
+  fi
+
+  cat <<EOF
+当前仓库:
+  remote   $url
+  平台     $_kind
+  API      $_base
+  项目     $_project
+  令牌     $(token_source)
+  镜像     $registry
+
+换 GitLab 时发给我这三样:
+  1. git remote -v
+  2. CI / Pipelines 网页
+  3. 该 GitLab 的私人令牌（read_api）
+     不要贴进对话。自己执行:
+     git config --global gitlab.<host>.token <令牌>
+     或说「令牌在剪贴板」
+
+我会配置:
+  gitlab.<host>.token   按主机存令牌，保留旧公司
+  gitlab.url            仅当网页主机和 git 主机不同
+  docker.registry       仅当镜像仓库换了
+  然后验证 /user 和该项目 pipelines
+EOF
+}
+
 create_and_push() {
   local version="$1"
   local remote branch
@@ -952,6 +1028,9 @@ case "${1:-}" in
     else
       die "用法: tag next [dev|pre|test]"
     fi
+    ;;
+  doctor)
+    show_doctor
     ;;
   -h|--help)
     usage

@@ -1,0 +1,23 @@
+---
+description: 换公司 GitLab 时，tag 监测进度的对接清单
+alwaysApply: true
+---
+
+# tag 换 GitLab
+
+监测进度按当前仓库的 `git remote` 推 GitLab API，不写死某一家公司。SSH 端口不要当成 HTTPS 端口；`group%2Fproject` 若 404，改用项目数字 ID。
+
+用户再说监测不到、换公司、换 GitLab 时：先让他跑 `tag doctor`，或只要下面三样。
+
+用户给：
+
+1. `git remote -v`
+2. CI / Pipelines 网页
+3. 该 GitLab 私人令牌（`read_api`）。不要让他贴进对话；让他执行 `git config --global gitlab.<host>.token <令牌>`，或说令牌在剪贴板再由我写入。
+
+我配：
+
+- `git config --global gitlab.<host>.token`（按主机，保留旧公司 `gitlab.token`）
+- 仅当网页主机 ≠ git 主机：`git config gitlab.url`
+- 仅当镜像仓库换了：`git config docker.registry`
+- 验证 `/api/v4/user` 和该项目 pipelines；令牌明文不要写回聊天
