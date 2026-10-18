@@ -37,6 +37,10 @@ usage() {
   GITLAB_TOKEN     GitLab 私人令牌，推送后跟踪 CI 打包进度
   TAG_WATCH=0      跳过远程打包跟踪
   DOCKER_REGISTRY  镜像仓库主机，默认 docker-registry.kangyishou.com
+
+Git 配置:
+  gitlab.token              默认 GitLab 令牌
+  gitlab.<host>.token       指定主机的令牌，例如 gitlab.git.jwyun.net.token
 EOF
 }
 
@@ -175,6 +179,9 @@ pack_token() {
       if [ -n "${GITLAB_TOKEN:-}${GITLAB_PRIVATE_TOKEN:-}${PRIVATE_TOKEN:-}" ]; then
         echo "${GITLAB_TOKEN:-${GITLAB_PRIVATE_TOKEN:-$PRIVATE_TOKEN}}"
         return
+      fi
+      if [ -n "${_host:-}" ]; then
+        git config --get "gitlab.${_host}.token" 2>/dev/null && return
       fi
       git config --get gitlab.token 2>/dev/null || true
       ;;
@@ -365,8 +372,44 @@ pct = 0
 pack_sum = ("pending", 0, 0)
 deploy_sum = ("pending", 0, 0)
 
+def gitlab_project_id(project):
+    # 部分 GitLab / nginx 会把 path 里的 %2F 打成 404，优先改用数字 ID
+    encoded = urllib.parse.quote(project.strip("/"), safe="")
+    code, data = gitlab("/projects/%s" % encoded)
+    if code == 200 and isinstance(data, dict) and data.get("id"):
+        return "ok", str(data["id"])
+    if code == 0:
+        return "unreachable", None
+    if code in (401, 403):
+        return "auth", None
+    name = project.strip("/").rsplit("/", 1)[-1]
+    q = urllib.parse.urlencode({
+        "search": name,
+        "simple": "true",
+        "membership": "true",
+        "per_page": 50,
+    })
+    code, data = gitlab("/projects?%s" % q)
+    if code == 0:
+        return "unreachable", None
+    if code in (401, 403):
+        return "auth", None
+    want = project.strip("/")
+    if code == 200 and isinstance(data, list):
+        for item in data:
+            if (item.get("path_with_namespace") or "").strip("/") == want:
+                return "ok", str(item["id"])
+    return "notfound", None
+
 if kind == "gitlab":
-    pid = urllib.parse.quote(project, safe="")
+    code, _me = gitlab("/user")
+    if code == 0:
+        emit("unreachable")
+    if code in (401, 403):
+        emit("auth")
+    status, pid = gitlab_project_id(project)
+    if status != "ok":
+        emit(status)
     q = urllib.parse.urlencode({"ref": tag, "sha": sha, "per_page": 5})
     code, data = gitlab("/projects/%s/pipelines?%s" % (pid, q))
     if code in (401, 403):
@@ -743,7 +786,19 @@ watch_remote_pack() {
       auth)
         trap - EXIT
         cleanup_watch
-        printf '%s远程打包跟踪失败：令牌无效或没有权限%s\n' "$C_GRAY" "$C_RESET"
+        printf '%s远程打包跟踪失败：令牌不被 %s 接受%s\n' "$C_GRAY" "${_base#*://}" "$C_RESET"
+        return 0
+        ;;
+      unreachable)
+        trap - EXIT
+        cleanup_watch
+        printf '%s无法连接 GitLab API（%s）%s\n' "$C_GRAY" "$_base" "$C_RESET"
+        return 0
+        ;;
+      notfound)
+        trap - EXIT
+        cleanup_watch
+        printf '%s看不到项目 %s（路径不对或令牌没有权限）%s\n' "$C_GRAY" "$_project" "$C_RESET"
         return 0
         ;;
       none|"")
