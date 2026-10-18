@@ -208,6 +208,10 @@ parse_remote_repo() {
   elif [[ "$url" =~ ^ssh://([^@]+@)?([^/]+)/(.+)$ ]]; then
     _host="${BASH_REMATCH[2]}"
     path="${BASH_REMATCH[3]}"
+    # ssh://host:10022/group/repo 里的端口是 Git SSH，不能拿去打 HTTPS API
+    if [[ "$_host" =~ :[0-9]+$ ]]; then
+      _host="${_host%:*}"
+    fi
   elif [[ "$url" =~ ^https?://([^/]+)/(.+)$ ]]; then
     _host="${BASH_REMATCH[1]}"
     path="${BASH_REMATCH[2]}"
