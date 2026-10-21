@@ -2,6 +2,10 @@
 
 2、将仓库克隆到本地 C:\Users\用户名\bin\
 
+```bash
+git clone git@github.com:Aithena/windows-bin.git ./bin
+```
+
 3、运行 Git
 
 ```
